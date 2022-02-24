@@ -1,0 +1,67 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backups-manager
+  labels:
+    app: backups-manager
+spec:
+  replicas: 1
+  revisionHistoryLimit: 2
+  progressDeadlineSeconds: 60
+  selector:
+    matchLabels:
+      app: backups-manager
+  template:
+    metadata:
+      labels:
+        app: backups-manager
+    spec:
+      serviceAccountName: backups-manager
+      enableServiceLinks: false
+      containers:
+        - name: app
+          image: app
+          ports:
+            - name: api
+              protocol: TCP
+              containerPort: 31000
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256M
+          volumeMounts:
+            - mountPath: /var/data
+              name: backups-manager-data
+          env:
+            - name: BACKUPSMGR_WORKINGDIR
+              value: "/var/data"
+            - name: BACKUPSMGR_BASEURL
+              value: "http://$HOSTNAME"
+            - name: BACKUPSMGR_GCP_ENCODED_JSON_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: backups-manager-gcp
+                  key: encodedjsonKey
+            - name: BACKUPSMGR_GCS_BUCKET_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: backups-manager-gcp
+                  key: gcsbucketname
+          livenessProbe:
+            httpGet:
+              port: api
+              path: /probes/liveness
+              scheme: HTTP
+            initialDelaySeconds: 1
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              port: api
+              path: /probes/readiness
+              scheme: HTTP
+            initialDelaySeconds: 1
+            periodSeconds: 10
+      volumes:
+        - name: backups-manager-data
+          persistentVolumeClaim:
+            claimName: backups-manager

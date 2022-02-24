@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: backups-manager
+  labels:
+    app: backups-manager
+spec:
+  type: ClusterIP
+  selector:
+    app: backups-manager
+  ports:
+    - name: api
+      protocol: TCP
+      port: 80

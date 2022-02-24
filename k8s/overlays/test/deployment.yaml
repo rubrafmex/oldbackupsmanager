@@ -1,0 +1,29 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backups-manager
+spec:
+  replicas: 1
+  template:
+    spec:
+      containers:
+        - name: app
+          env:
+            - name: BACKUPSMGR_DB_HOST
+              value: "cockroachdb-public.$CRDB_NAMESPACE:26257"
+            - name: BACKUPSMGR_DB_USER
+              value: "$DATABASE_USER"
+            - name: BACKUPSMGR_DB_NAME
+              value: "$DATABASE_NAME"
+            - name: BACKUPSMGR_DB_OPTIONS
+              value: "sslmode=disable"
+            - name: BACKUPSMGR_GCP_BASE64_ENCODED_JSON_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: backups-manager-gcp
+                  key: GCP_BASE64_JSON_KEY
+            - name: BACKUPSMGR_GCS_BUCKET_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: backups-manager-gcp
+                  key: GCP_BUCKET_NAME

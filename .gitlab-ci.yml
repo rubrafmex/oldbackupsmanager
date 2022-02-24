@@ -1,0 +1,205 @@
+include:
+  - project: 'cicd/gitlab-ci'
+    file: '/mergerequest.yml'
+  - project: 'cicd/gitlab-ci'
+    file: '/versionbadge.yml'
+
+variables:
+  K8S_DEPLOYMENT: deployment/backups-manager
+  DOCKERIMAGE_GO: gitlabregistry.cmpayments.local/cicd/docker/go:v1.17
+
+stages:
+  - test
+  - build
+  - dockerize
+  - prepare test
+  - deploy test
+  - prepare acceptance
+  - deploy acceptance
+  - prepare production
+  - deploy
+
+# Automatically create merge requests for new branches
+mergerequest:
+  extends: .mergerequest
+
+# Lint code for all branches
+lint:
+  stage: test
+  only:
+    refs: [ branches ]
+  needs: [ ]
+  dependencies: [ ]
+  tags: [ docker ]
+  image: $DOCKERIMAGE_GO
+  script:
+    # https://docs.gitlab.com/ee/user/project/merge_requests/code_quality.html#implementing-a-custom-tool
+    - golangci-lint run --out-format code-climate > gl-code-quality-report.json || golangci-lint run
+  artifacts:
+    when: always
+    reports:
+      codequality: gl-code-quality-report.json
+
+# Run unit tests for all branches
+unittests:
+  stage: test
+  only:
+    refs: [ branches ]
+  needs: [ ]
+  dependencies: [ ]
+  tags: [ docker ]
+  image: $DOCKERIMAGE_GO
+  script:
+    - go test -coverprofile=coverage.out -v 2>&1 ./... | go-junit-report -set-exit-code > unittests.xml || go test ./...
+    - go tool cover -func=coverage.out
+  coverage: /^total:\s+\(statements\)\s+([0-9]+\.[0-9]+)%/
+  artifacts:
+    when: always
+    reports:
+      junit: unittests.xml
+
+# Build a go binary for all branches
+go build:
+  stage: build
+  only:
+    refs: [ branches ]
+  dependencies: [ ]
+  variables:
+    COMMAND: app
+  tags: [ docker ]
+  image: $DOCKERIMAGE_GO
+  script:
+    - GOOS=linux GOARCH=amd64 go build -o bin/$COMMAND ./cmd/$COMMAND
+  artifacts:
+    paths:
+      - bin/$COMMAND
+
+# Build the application image
+# We do not use a multistage build, because it cant leverage the go build cache from the runner
+docker build:
+  stage: dockerize
+  only:
+    refs: [ branches ]
+  dependencies: [ "go build" ]
+  variables:
+    COMMAND: app
+    DOCKERFILE: ./Dockerfile
+  tags: [ docker-image-builder ]
+  before_script:
+    - echo -n $CI_REGISTRY_PASSWORD | docker login -u $CI_REGISTRY_USER --password-stdin $CI_REGISTRY
+  script:
+    - docker build -f $DOCKERFILE --tag $CI_REGISTRY_IMAGE/$COMMAND:$CI_COMMIT_SHORT_SHA .
+    - docker push $CI_REGISTRY_IMAGE/$COMMAND:$CI_COMMIT_SHORT_SHA
+
+# Kustomize the environment overlay
+kustomize test env:
+  stage: prepare test
+  extends: [ .env_test, .kustomize ]
+  dependencies: [ ]
+  variables:
+    DEPLOY_VERSION: $CI_COMMIT_SHORT_SHA
+
+deploy to test env:
+  stage: deploy test
+  extends: [ .env_test, .deploy ]
+  dependencies: [ kustomize test env ]
+  environment:
+    name: test
+    url: http://backups-manager.test.cmpayments.local
+
+# Kustomize the environment overlay
+kustomize acceptance env:
+  stage: prepare acceptance
+  extends: [ .env_acceptance, .kustomize ]
+  dependencies: [ ]
+  variables:
+    DEPLOY_VERSION: $CI_COMMIT_SHORT_SHA
+
+deploy to acceptance env:
+  stage: deploy acceptance
+  extends: [ .env_acceptance, .deploy ]
+  dependencies: [ kustomize acceptance env ]
+  environment:
+    name: acceptance
+    url: http://backups-manager.acceptance.cmpayments.local
+
+.kustomize:
+  tags: [ docker ]
+  except:
+    variables:
+      - $DEPLOY_VERSION == null
+  image: gitlabregistry.cmpayments.local/cicd/docker/kubectl:v1
+  script:
+    - cd k8s/overlays/$KUSTOMIZE_OVERLAY
+    - kustomize edit set image app=$CI_REGISTRY_IMAGE/app:$DEPLOY_VERSION
+    # envsubst is used to replace references to environment variables
+    - kustomize build | envsubst > $CI_PROJECT_DIR/deploy.yaml
+  artifacts:
+    paths:
+      - $CI_PROJECT_DIR/deploy.yaml
+
+.deploy:
+  tags: [ docker, pks-deploy ]
+  except:
+    variables:
+      - $K8S_CONTEXT == null
+      - $K8S_NAMESPACE == null
+      - $K8S_DEPLOYMENT == null
+  variables:
+    GIT_STRATEGY: none # The deploy.yaml is an artifact, not part of the repo
+  image: gitlabregistry.cmpayments.local/cicd/docker/kubectl:v1
+  before_script:
+    # K8s namespaces have a maximum length of 63 characters
+    - K8S_NAMESPACE=$(printf '%.63s' "$K8S_NAMESPACE" | sed "s/-$//")
+  script:
+    # capture the current revision of the deployment
+    - PREVIOUS=$(kubectl --context=$K8S_CONTEXT --namespace=$K8S_NAMESPACE rollout history $K8S_DEPLOYMENT -o jsonpath="{.metadata.annotations.deployment\.kubernetes\.io/revision}" || echo 0)
+    - echo "Previous revision is $PREVIOUS"
+
+    - kubectl create namespace $K8S_NAMESPACE --dry-run=client -o=yaml | kubectl --context=$K8S_CONTEXT apply -f -
+    - 'kubectl --context=$K8S_CONTEXT --namespace=$K8S_NAMESPACE apply -f $CI_PROJECT_DIR/deploy.yaml --record=true'
+
+    # wait for rollout to complete
+    - >
+      if ! kubectl --context=$K8S_CONTEXT --namespace=$K8S_NAMESPACE rollout status $K8S_DEPLOYMENT; then
+        # Find the new replicaset
+        NEWREPLICASET=$(kubectl --context=$K8S_CONTEXT --namespace=$K8S_NAMESPACE describe $K8S_DEPLOYMENT | grep -m 1 '^NewReplicaSet:' | awk '{print $2}')
+        # Show the logs with, hopefully, the reason for failure
+        kubectl --context=$K8S_CONTEXT --namespace=$K8S_NAMESPACE logs "replicaset/$NEWREPLICASET" --all-containers || true
+
+        # undo rollout
+        kubectl --context=$K8S_CONTEXT --namespace=$K8S_NAMESPACE rollout undo $K8S_DEPLOYMENT --to-revision="$PREVIOUS" || true
+        exit 1
+      fi
+
+    - echo "Deployed to $CI_ENVIRONMENT_URL"
+
+#
+# Below are the environments
+#
+
+.env_test:
+  only:
+    refs: [ "master" ]
+  variables:
+    K8S_CONTEXT: pq-t-br-paymentsgateway
+    K8S_NAMESPACE: crdb-test
+    KUSTOMIZE_OVERLAY: test
+
+    CRDB_NAMESPACE: crdb-test
+
+    # Beware there is a copy in deploy to ... env > environment:url:
+    # Used in docker.ini
+    HOSTNAME: backups-manager.test.cmpayments.local
+
+.env_acceptance:
+  only:
+    refs: [ "master" ]
+  variables:
+    K8S_CONTEXT: pq-p-eh-paymentsgateway
+    K8S_NAMESPACE: crdb-accept
+    KUSTOMIZE_OVERLAY: acceptance
+
+    # Beware there is a copy in deploy to ... env > environment:url:
+    # Used in docker.ini
+    HOSTNAME: backups-manager.test.cmpayments.local

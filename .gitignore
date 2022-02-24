@@ -1,0 +1,7 @@
+/.idea
+/.run
+/vendor
+/make*
+/config.ini
+/sidecar.config.ini
+.DS_Store
